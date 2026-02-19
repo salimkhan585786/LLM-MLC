@@ -2,7 +2,6 @@ import { llama } from '@react-native-ai/llama';
 import { embed } from 'ai';
 import * as FileSystem from 'expo-file-system/legacy';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import * as Asset from 'expo-asset';
 // In‑memory vector store
 let vectorStore = []; // { text, embedding, timestamp }
 let embedModel = null;
@@ -10,21 +9,12 @@ let embedModel = null;
 // Path to the bundled model in your app
 const BUNDLED_MODEL_NAME = 'bge-small-en-v1.5-q4_k_m.gguf';
 
-export const initVectorStore = async () => {
-  try {
-    const saved = await AsyncStorage.getItem('@embeddings');
-    if (saved) {
-      vectorStore = JSON.parse(saved);
-      console.log(`📚 Loaded ${vectorStore.length} saved embeddings`);
-    }
-  } catch (error) {
-    console.log('No saved embeddings found');
-  }
-};
 
 const saveEmbeddings = async () => {
   try {
-    const toSave = vectorStore.slice(-100);
+    // Prune old/low-relevance: Keep top 100 recent + high similarity (optional periodic call)
+    vectorStore.sort((a, b) => b.timestamp - a.timestamp); // Recent first
+    const toSave = vectorStore.slice(0, 100); // Cap at 100
     await AsyncStorage.setItem('@embeddings', JSON.stringify(toSave));
   } catch (error) {
     console.error('Failed to save embeddings:', error);
@@ -92,7 +82,7 @@ export const addMessageEmbedding = async (text) => {
       text, 
       embedding, 
       timestamp: Date.now(),
-      sentiment: text.includes('happy') ? 'positive' : 'neutral' // Simple sentiment tagging
+      sentiment: detectSentiment(text) // Improved tagging
     });
     
     await saveEmbeddings();
@@ -103,8 +93,15 @@ export const addMessageEmbedding = async (text) => {
     return null;
   }
 };
-
-export const findSimilarMessages = async (query, topK = 3) => {
+// Simple sentiment detection (expand with more words/rules)
+function detectSentiment(text) {
+  const positiveWords = ['happy', 'great', 'love', 'good', 'awesome'];
+  const negativeWords = ['sad', 'bad', 'hate', 'wrong'];
+  if (positiveWords.some(w => text.toLowerCase().includes(w))) return 'positive';
+  if (negativeWords.some(w => text.toLowerCase().includes(w))) return 'negative';
+  return 'neutral';
+}
+export const findSimilarMessages = async (query, topK = 4) => {
   if (!embedModel || vectorStore.length === 0) return [];
   
   try {
@@ -113,20 +110,35 @@ export const findSimilarMessages = async (query, topK = 3) => {
       value: query 
     });
 
+    // Query sentiment for filtering
+    const querySentiment = detectSentiment(query);
+
     const similarities = vectorStore.map((item) => ({
       ...item,
-      similarity: cosineSimilarity(queryEmbedding, item.embedding),
+      similarity: cosineSimilarity(queryEmbedding, item.embedding) * (1 + (item.timestamp / Date.now()) * 0.2), // Weight recent 20% more
     }));
     
-    similarities.sort((a, b) => b.similarity - a.similarity);
+    // Filter: High threshold, matching sentiment, relevant to query (simple keyword overlap check)
+    const filtered = similarities
+      .filter(item => item.similarity > 0.7 && item.sentiment === querySentiment && hasKeywordOverlap(query, item.text))
+      .sort((a, b) => b.similarity - a.similarity);
     
-    return similarities.slice(0, topK).map((item) => item.text);
+    // Dynamic topK: Up to 6 if many high scores, but truncate each text to 100 chars
+    const maxItems = filtered.length > 4 ? Math.min(6, filtered.length) : topK;
+    return filtered.slice(0, maxItems).map(item => item.text.slice(0, 100) + (item.text.length > 100 ? '...' : '')); // Truncate for efficiency
   } catch (error) {
     console.error('Failed to find similar messages:', error);
     return [];
   }
 };
 
+// Simple overlap: At least 1 shared non-stop word
+function hasKeywordOverlap(query, text) {
+  const stopWords = new Set(['the', 'is', 'a', 'an', 'to', 'in', 'on', 'and', 'or']);
+  const queryWords = query.toLowerCase().split(/\s+/).filter(w => !stopWords.has(w));
+  const textWords = text.toLowerCase().split(/\s+/).filter(w => !stopWords.has(w));
+  return queryWords.some(qw => textWords.includes(qw));
+}
 function cosineSimilarity(a, b) {
   const dot = a.reduce((sum, val, i) => sum + val * b[i], 0);
   const normA = Math.sqrt(a.reduce((sum, val) => sum + val * val, 0));

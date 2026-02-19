@@ -4,45 +4,41 @@ import {
   Text,
   Animated,
   Easing,
+  StyleSheet,
 } from 'react-native';
 
-// Thinking animation component
-const ThinkingIndicator = ({ text }) => {
-  const bounceAnim = useRef(new Animated.Value(0)).current;
+export const TypingDots = ({ text }) => {
   const dot1 = useRef(new Animated.Value(0)).current;
   const dot2 = useRef(new Animated.Value(0)).current;
   const dot3 = useRef(new Animated.Value(0)).current;
 
   useEffect(() => {
-    // Create bouncing animation for all dots
-    const createBounceAnimation = (dot, delay) => {
+    const createWaveAnimation = (dot, delay) => {
       return Animated.loop(
         Animated.sequence([
+          Animated.delay(delay),
           Animated.timing(dot, {
-            toValue: -5,
-            duration: 300,
-            easing: Easing.bounce,
+            toValue: 1,
+            duration: 400,
+            easing: Easing.inOut(Easing.ease),
             useNativeDriver: true,
           }),
           Animated.timing(dot, {
             toValue: 0,
-            duration: 300,
-            easing: Easing.bounce,
+            duration: 400,
+            easing: Easing.inOut(Easing.ease),
             useNativeDriver: true,
           }),
-        ]),
-        { delay }
+        ])
       );
     };
 
-    // Start animations with different delays
     Animated.parallel([
-      createBounceAnimation(dot1, 0),
-      createBounceAnimation(dot2, 150),
-      createBounceAnimation(dot3, 300),
+      createWaveAnimation(dot1, 0),
+      createWaveAnimation(dot2, 133),
+      createWaveAnimation(dot3, 266),
     ]).start();
 
-    // Cleanup
     return () => {
       dot1.stopAnimation();
       dot2.stopAnimation();
@@ -50,40 +46,36 @@ const ThinkingIndicator = ({ text }) => {
     };
   }, []);
 
+  const getDotStyle = (anim) => ({
+    opacity: anim,
+    transform: [
+      {
+        translateY: anim.interpolate({
+          inputRange: [0, 1],
+          outputRange: [0, -5],
+        }),
+      },
+    ],
+  });
+
   return (
     <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-      <Text>{text}</Text>
-      <View style={{ flexDirection: 'row', marginLeft: 5 }}>
-        <Animated.Text
-          style={{
-            transform: [{ translateY: dot1 }],
-            fontSize: 20,
-            marginHorizontal: 1,
-          }}
-        >
-          .
-        </Animated.Text>
-        <Animated.Text
-          style={{
-            transform: [{ translateY: dot2 }],
-            fontSize: 20,
-            marginHorizontal: 1,
-          }}
-        >
-          .
-        </Animated.Text>
-        <Animated.Text
-          style={{
-            transform: [{ translateY: dot3 }],
-            fontSize: 20,
-            marginHorizontal: 1,
-          }}
-        >
-          .
-        </Animated.Text>
+      <Text style={styles.messageText}>{text}</Text>
+      <View style={{ flexDirection: 'row', marginLeft: 8 }}>
+        <Animated.Text style={[styles.typingDot, getDotStyle(dot1)]}>•</Animated.Text>
+        <Animated.Text style={[styles.typingDot, getDotStyle(dot2)]}>•</Animated.Text>
+        <Animated.Text style={[styles.typingDot, getDotStyle(dot3)]}>•</Animated.Text>
       </View>
     </View>
   );
 };
 
-export default ThinkingIndicator;
+// Add to your styles:
+const styles = StyleSheet.create({
+  // ... existing styles
+  typingDot: {
+    fontSize: 24,
+    color: '#666',
+    marginHorizontal: 2,
+  },
+});
