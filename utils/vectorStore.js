@@ -91,7 +91,8 @@ export const addMessageEmbedding = async (text) => {
     vectorStore.push({ 
       text, 
       embedding, 
-      timestamp: Date.now() 
+      timestamp: Date.now(),
+      sentiment: text.includes('happy') ? 'positive' : 'neutral' // Simple sentiment tagging
     });
     
     await saveEmbeddings();

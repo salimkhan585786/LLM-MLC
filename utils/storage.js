@@ -17,7 +17,7 @@ export const loadMessages = async () => {
 
 export const getUserPreferences = async () => {
   const data = await AsyncStorage.getItem(PREFERENCES_KEY);
-  return data ? JSON.parse(data) : { likes: [], dislikes: [], topics: [] };
+  return data ? JSON.parse(data) : { likes: [], dislikes: [], topics: [],behaviors: {} };
 };
 
 export const updateUserPreferences = async (newPrefs) => {
