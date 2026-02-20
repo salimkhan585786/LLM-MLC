@@ -26,11 +26,8 @@ import {
 } from '../utils/storage';
 import * as Clipboard from 'expo-clipboard';
 import {
-  initEmbeddingModel,
-  addMessageEmbedding,
+  addMessageToStore,
   findSimilarMessages,
-  unloadEmbeddingModel,
-  getVectorStoreStats,
 } from '../utils/vectorStore';
 import { CONFIG } from '../utils/config';
 import { TypingDots } from '../component/Thinking';
@@ -152,7 +149,6 @@ export default function ChatScreen() {
     setup();
 
     return () => {
-      unloadEmbeddingModel();
       if (abortControllerRef.current) {
         abortControllerRef.current.abort();
       }
@@ -179,17 +175,9 @@ export default function ChatScreen() {
       // Prepare model in background
       await llmModel.current.prepare();
 
-      // Initialize embedding model without blocking
-      setTimeout(() => {
-        initEmbeddingModel().catch(console.error);
-      }, 100);
-
       setDownloadProgress(null);
       setShowDownloadModal(false);
       setModelsReady(true);
-
-      const stats = getVectorStoreStats();
-      console.log('Vector store stats:', stats);
     } catch (error) {
       setShowDownloadModal(false);
       console.error('Model initialization failed:', error);
@@ -329,9 +317,9 @@ export default function ChatScreen() {
     const updateQueue = [];
 
     try {
-      // Non-blocking embedding
+      // Non-blocking add to store
       // setTimeout(() => {
-      //   addMessageEmbedding(userMsg.content).catch(console.error);
+      //   addMessageToStore(userMsg.content).catch(console.error);
       // }, 0);
 
       // Parallel execution where possible
@@ -423,8 +411,8 @@ export default function ChatScreen() {
         // Parallel operations
           await Promise.all([
           storeMessage(finalAssistantMsg),
-          addMessageEmbedding(userMsg.content).catch(() => { }),     // user message
-          addMessageEmbedding(fullAssistantContent).catch(() => { }), // assistant reply
+          addMessageToStore(userMsg.content).catch(() => { }),     // user message
+          addMessageToStore(fullAssistantContent).catch(() => { }), // assistant reply
         ]);
 
         // Batch final state updates

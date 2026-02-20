@@ -11,22 +11,46 @@ const CACHE_TTL = 30000; // 30 seconds
 
 // Compiled regex patterns for better performance (pre-compiled outside function)
 const LIKE_PATTERNS = [
-  { pattern: /i (like|love|enjoy|prefer) (?!don't|do not)(.+?)(?:\.|$)/i, group: 2 },
+  { pattern: /i (like|love|enjoy|prefer|am interested in|am passionate about|spend time on|spend my time) (?!don't|do not)(.+?)(?:\.|$)/i, group: 2 },
   { pattern: /my favorite (?:is|are) (.+?)(?:\.|$)/i, group: 1 },
-  { pattern: /i'm (?:a|an) (.+?) (?:fan|person|lover)/i, group: 1 }
+  { pattern: /i'm (?:a|an) (.+?) (?:fan|person|lover|enthusiast)/i, group: 1 },
+  { pattern: /my (hobby|hobbies|interest|interests|like|likes|passion|passions) (?:are|is) (.+?)(?:\.|$)/i, group: 2 },
+  { pattern: /i (enjoy|love|like|do|play|collect|watch|read|practice|build|create|explore) (.+?)(?:\.|$)/i, group: 2 },
+  { pattern: /i(?:'m|'ve|'d) (?:into|obsessed with|fascinated by|hooked on) (.+?)(?:\.|$)/i, group: 1 },
+  { pattern: /favorite (?:hobby|thing|activity|interest|pastime|way to relax) (?:is|are) (.+?)(?:\.|$)/i, group: 1 },
+  { pattern: /i love to (.+?)(?:\.|$)/i, group: 1 },
+  { pattern: /one of my (hobbies|interests|likes|favorites) is (.+?)(?:\.|$)/i, group: 2 },
+  { pattern: /i(?:'m|'ve) always enjoyed (.+?)(?:\.|$)/i, group: 1 },
+  { pattern: /my go-to (activity|hobby|interest) is (.+?)(?:\.|$)/i, group: 2 },
+  { pattern: /i find (.+?) relaxing|exciting|fulfilling/i, group: 1 },
+  // Put these FIRST in the LIKE_PATTERNS array
+{ pattern: /i like (.+?)(?:and\s+)?i\s/i, group: 1 },                    // "I like A and I"
+{ pattern: /i like (.+?)(?:\s+and\s+|\s*,\s*)/i, group: 1 },            // "I like A, B and C"
+{ pattern: /i (?:like|love|enjoy) (.+?)(?:\s+and\s+|\s*,\s*|$)/gi, group: 1 }, // repeated matches
 ];
 
 const DISLIKE_PATTERNS = [
   { pattern: /i (?:don't|do not) (?:like|love|enjoy|prefer) (.+?)(?:\.|$)/i, group: 1 },
   { pattern: /i hate (.+?)(?:\.|$)/i, group: 1 },
-  { pattern: /i (?:can't|cannot) stand (.+?)(?:\.|$)/i, group: 1 }
+  { pattern: /i (?:can't|cannot) stand (.+?)(?:\.|$)/i, group: 1 },
+  { pattern: /i(?:'m|'ve) not into (.+?)(?:\.|$)/i, group: 1 },
+  { pattern: /i avoid (.+?)(?:\.|$)/i, group: 1 },
+  { pattern: /(.+?) bores me/i, group: 1 },
+  { pattern: /i find (.+?) annoying|frustrating|unappealing/i, group: 1 }
+];
+
+const NAME_PATTERNS = [
+  { pattern: /my name is (.+?)(?:\.|$)/i, group: 1 },
+  { pattern: /i(?:'m| am) called (.+?)(?:\.|$)/i, group: 1 },
+  { pattern: /call me (.+?)(?:\.|$)/i, group: 1 }
 ];
 
 // Topic keywords as a Set for O(1) lookup
 const TOPIC_KEYWORDS = new Set([
   'movies', 'music', 'books', 'sports', 'food', 'travel', 
   'technology', 'science', 'art', 'politics', 'gaming', 'fashion',
-  'health', 'fitness', 'business', 'education', 'nature', 'animals'
+  'health', 'fitness', 'business', 'education', 'nature', 'animals',
+  'coding', 'programming', 'painting', 'biking', 'writing', 'journaling'
 ]);
 
 // Message queue for batch processing
@@ -54,9 +78,11 @@ export const storeMessage = async (message) => {
   }, 0);
   
   // If it's a user message, queue for preference extraction
-  if (message.role === 'user') {
-    queueMessageForPreferenceExtraction(message.content);
-  }
+ const seen = new Set();
+if (message.role === 'user' && !seen.has(message.content)) {
+  seen.add(message.content);
+  queueMessageForPreferenceExtraction(message.content);
+}
   
   return updated;
 };
@@ -80,21 +106,17 @@ const processMessageQueue = async () => {
     return;
   }
   
-  // Take batch from queue
   const batch = messageQueue.splice(0, BATCH_SIZE);
   
   try {
-    // Load preferences once for the entire batch
     const prefs = await getUserPreferences();
     let updated = false;
     
-    // Process each message in the batch
     for (const message of batch) {
       const messageUpdated = extractPreferencesFromMessageSync(message, prefs);
       updated = updated || messageUpdated;
     }
     
-    // Save only once if any updates occurred
     if (updated) {
       await debouncedSavePreferences(prefs);
     }
@@ -102,12 +124,26 @@ const processMessageQueue = async () => {
     console.error('Error processing message batch:', error);
   }
   
-  // Process next batch if queue still has items
   if (messageQueue.length > 0) {
-    // setTimeout(processMessageQueue, BATCH_DELAY);
+    setTimeout(processMessageQueue, BATCH_DELAY);
   } else {
     isProcessingQueue = false;
   }
+};
+
+// Helper to process captured text into multiple items (handles lists like "A, B, and C")
+const processCapturedItems = (captured) => {
+  const cleaned = captured
+    .replace(/\n+/g, ', ')           // newlines → comma + space
+    .replace(/\s+and\s+/gi, ', ')    // "and" → comma
+    .replace(/\s*,\s*/g, ',')        // normalize commas
+    .replace(/\s+for\s+currently/gi, ''); // remove trailing noise
+
+  return cleaned
+    .split(',')
+    .map(s => s.trim().toLowerCase())
+    .map(s => s.replace(/^(the|a|an|my|i|and|or)\s+/i, ''))
+    .filter(s => s.length > 3 && !/^(until|for|currently|about|in)$/i.test(s));
 };
 
 // Synchronous version for batch processing
@@ -116,17 +152,32 @@ const extractPreferencesFromMessageSync = (message, prefs) => {
   const lowerMessage = message.toLowerCase();
   let updated = false;
 
+  // Extract name if mentioned
+  for (const { pattern, group } of NAME_PATTERNS) {
+    const match = message.match(pattern);
+    if (match && match[group]) {
+      const name = match[group].trim();
+      if (name.length > 0 && (!prefs.name || prefs.name !== name)) {
+        prefs.name = name;
+        updated = true;
+      }
+      break;
+    }
+  }
+
   // Process likes (break early if no match to save CPU)
   for (const { pattern, group } of LIKE_PATTERNS) {
     const match = lowerMessage.match(pattern);
     if (match && match[group]) {
-      const like = match[group].trim();
-      if (like.length > 0 && !prefs.likes.includes(like)) {
-        prefs.likes.push(like);
-        updated = true;
-        // Keep only last 20 likes to prevent unbounded growth
-        if (prefs.likes.length > 20) prefs.likes.shift();
-      }
+      const captured = match[group].trim();
+      const likes = processCapturedItems(captured);
+      likes.forEach(like => {
+        if (like.length > 0 && !prefs.likes.includes(like)) {
+          prefs.likes.push(like);
+          updated = true;
+          if (prefs.likes.length > 20) prefs.likes.shift();
+        }
+      });
       break; // Found a like, no need to check other patterns
     }
   }
@@ -135,12 +186,15 @@ const extractPreferencesFromMessageSync = (message, prefs) => {
   for (const { pattern, group } of DISLIKE_PATTERNS) {
     const match = lowerMessage.match(pattern);
     if (match && match[group]) {
-      const dislike = match[group].trim();
-      if (dislike.length > 0 && !prefs.dislikes.includes(dislike)) {
-        prefs.dislikes.push(dislike);
-        updated = true;
-        if (prefs.dislikes.length > 20) prefs.dislikes.shift();
-      }
+      const captured = match[group].trim();
+      const dislikes = processCapturedItems(captured);
+      dislikes.forEach(dislike => {
+        if (dislike.length > 0 && !prefs.dislikes.includes(dislike)) {
+          prefs.dislikes.push(dislike);
+          updated = true;
+          if (prefs.dislikes.length > 20) prefs.dislikes.shift();
+        }
+      });
       break;
     }
   }
@@ -176,6 +230,14 @@ const extractPreferencesFromMessageSync = (message, prefs) => {
     updated = true;
   }
 
+  // Store recent user statements for better context (last 10 raw messages)
+ prefs.recentUserStatements = prefs.recentUserStatements || [];
+if (!prefs.recentUserStatements.includes(message)) {
+  prefs.recentUserStatements.push(message);
+  if (prefs.recentUserStatements.length > 10) prefs.recentUserStatements.shift();
+  updated = true;
+}
+
   return updated;
 };
 
@@ -193,7 +255,8 @@ const debouncedSavePreferences = (prefs) => {
         // Update cache
         preferencesCache = prefs;
         cacheTimestamp = Date.now();
-        console.log('Preferences saved:', prefs);
+
+console.log('Current user profile:', prefs);
         resolve(prefs);
       } catch (error) {
         console.error('Failed to save preferences:', error);
@@ -225,10 +288,12 @@ export const getUserPreferences = async () => {
   try {
     const data = await AsyncStorage.getItem(PREFERENCES_KEY);
     const prefs = data ? JSON.parse(data) : { 
+      name: '',
       likes: [], 
       dislikes: [], 
       topics: [], 
-      behaviors: {} 
+      behaviors: {},
+      recentUserStatements: []
     };
     
     // Update cache
@@ -238,7 +303,7 @@ export const getUserPreferences = async () => {
     return prefs;
   } catch (error) {
     console.error('Failed to load preferences:', error);
-    return { likes: [], dislikes: [], topics: [], behaviors: {} };
+    return { name: '', likes: [], dislikes: [], topics: [], behaviors: {}, recentUserStatements: [] };
   }
 };
 
