@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, memo } from 'react';
+import React, { useState, useEffect, useRef, memo, useCallback, useMemo } from 'react';
 import {
   View,
   Text,
@@ -11,15 +11,18 @@ import {
   Platform,
   Alert,
   Keyboard,
+  ActionSheetIOS,
+  InteractionManager,
 } from 'react-native';
-import { FlashList } from '@shopify/flash-list'; // expo install @shopify/flash-list
+import { FlashList } from '@shopify/flash-list';
 import { mlc } from '@react-native-ai/mlc';
-import { streamText } from 'ai';
+import { smoothStream, streamText } from 'ai';
 import {
   storeMessage,
   loadMessages,
-  updateUserPreferences,
   getUserPreferences,
+  addUserLike,
+  addUserDislike,
 } from '../utils/storage';
 import * as Clipboard from 'expo-clipboard';
 import {
@@ -31,40 +34,81 @@ import {
 } from '../utils/vectorStore';
 import { CONFIG } from '../utils/config';
 import { TypingDots } from '../component/Thinking';
-import throttle from 'lodash.throttle'; // expo install lodash.throttle
+import throttle from 'lodash.throttle';
 
-const LLM_MODEL_ID = 'Llama-3.2-3B-Instruct';
+const LLM_MODEL_ID = 'Llama-3.2-1B-Instruct';
 const BATCH_SIZE = 20;
 
-const MemoizedMessageItem = memo(({ item, onCopy }) => (
-  <TouchableOpacity
-    style={[
-      styles.message,
-      item.role === 'user' ? styles.userMessage : styles.assistantMessage,
-    ]}
-    onLongPress={onCopy}
-    activeOpacity={0.7}
-  >
-    <View style={{ position: 'relative' }}>
-      {item.isThinking ? (
-        <TypingDots text={item.content} />
-      ) : (
-        <Text style={styles.messageText}>{item.content}</Text>
-      )}
-    </View>
-    <Text style={styles.timestamp}>
-      {new Date(item.timestamp).toLocaleTimeString([], {
-        hour: '2-digit',
-        minute: '2-digit',
-      })}
-    </Text>
-  </TouchableOpacity>
-));
+// Optimized MessageItem with useCallback for handlers
+const MemoizedMessageItem = memo(({ item, onCopy, onAddToLikes, onAddToDislikes }) => {
+  const handleLongPress = useCallback(() => {
+    if (Platform.OS === 'ios') {
+      ActionSheetIOS.showActionSheetWithOptions(
+        {
+          options: ['Cancel', 'Copy', 'Add to Likes', 'Add to Dislikes'],
+          cancelButtonIndex: 0,
+        },
+        (buttonIndex) => {
+          if (buttonIndex === 1) onCopy();
+          else if (buttonIndex === 2) onAddToLikes();
+          else if (buttonIndex === 3) onAddToDislikes();
+        }
+      );
+    } else {
+      Alert.alert(
+        'Message Options',
+        'Choose an action',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Copy', onPress: onCopy },
+          { text: 'Add to Likes', onPress: onAddToLikes },
+          { text: 'Add to Dislikes', onPress: onAddToDislikes },
+        ],
+        { cancelable: true }
+      );
+    }
+  }, [onCopy, onAddToLikes, onAddToDislikes]);
+
+  // Memoize timestamp to prevent recalculation
+  const formattedTime = useMemo(() => {
+    return new Date(item.timestamp).toLocaleTimeString([], {
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  }, [item.timestamp]);
+
+  return (
+    <TouchableOpacity
+      style={[
+        styles.message,
+        item.role === 'user' ? styles.userMessage : styles.assistantMessage,
+      ]}
+      onLongPress={handleLongPress}
+      activeOpacity={0.7}
+      delayLongPress={500} // Add delay to prevent accidental triggers
+    >
+      <View style={{ position: 'relative' }}>
+        {item.isThinking ? (
+          <TypingDots text={item.content} />
+        ) : (
+          <Text style={styles.messageText}>{item.content}</Text>
+        )}
+      </View>
+      <Text style={styles.timestamp}>{formattedTime}</Text>
+    </TouchableOpacity>
+  );
+}, (prevProps, nextProps) => {
+  // Custom comparison to prevent unnecessary re-renders
+  return prevProps.item.content === nextProps.item.content &&
+    prevProps.item.isThinking === nextProps.item.isThinking &&
+    prevProps.item.timestamp === nextProps.item.timestamp;
+});
 
 export default function ChatScreen() {
-  const [messages, setMessages] = useState([]); // Visible paginated messages
-  const [allMessages, setAllMessages] = useState([]); // Full history
-  const [streamingAssistant, setStreamingAssistant] = useState(null); // Active typing message
+  // State declarations
+  const [messages, setMessages] = useState([]);
+  const [allMessages, setAllMessages] = useState([]);
+  const [streamingAssistant, setStreamingAssistant] = useState(null);
   const [inputText, setInputText] = useState('');
   const [downloadProgress, setDownloadProgress] = useState(null);
   const [modelsReady, setModelsReady] = useState(false);
@@ -73,19 +117,34 @@ export default function ChatScreen() {
   const [isLoadingMore, setIsLoadingMore] = useState(false);
   const [hasMoreMessages, setHasMoreMessages] = useState(true);
   const [isLoading, setIsLoading] = useState(true);
+
+  // Refs for performance optimization
   const llmModel = useRef(null);
   const flatListRef = useRef(null);
-  const isFirstTokenRef = useRef(true);
   const isScrolledToBottom = useRef(true);
+  const updateScheduledRef = useRef(false);
+  const abortControllerRef = useRef(null);
+
+  // Throttled scroll function
+  const throttledScrollToBottom = useRef(
+    throttle((animated) => {
+      if (flatListRef.current && isScrolledToBottom.current) {
+        flatListRef.current.scrollToEnd({ animated });
+      }
+    }, 100)
+  ).current;
 
   useEffect(() => {
     const setup = async () => {
       try {
-        await initializeModels();
-        await loadHistory();
+        // Use InteractionManager to run after animations complete
+        InteractionManager.runAfterInteractions(async () => {
+          await initializeModels();
+          await loadHistory();
+          setIsLoading(false);
+        });
       } catch (e) {
         console.error(e);
-      } finally {
         setIsLoading(false);
       }
     };
@@ -94,22 +153,36 @@ export default function ChatScreen() {
 
     return () => {
       unloadEmbeddingModel();
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
     };
   }, []);
 
   const initializeModels = async () => {
+    console.log('HIT Initializing LLM model:', LLM_MODEL_ID);
     try {
       setDownloadProgress({ model: LLM_MODEL_ID, percent: 0 });
       llmModel.current = mlc.languageModel(LLM_MODEL_ID);
+
+      // Download with progress updates (throttled)
       await llmModel.current.download((event) => {
         if (!isNaN(event.percentage)) {
-          setShowDownloadModal(true);
-          setDownloadProgress({ model: LLM_MODEL_ID, percent: event.percentage });
+          // Throttle progress updates to reduce renders
+          requestAnimationFrame(() => {
+            setShowDownloadModal(true);
+            setDownloadProgress({ model: LLM_MODEL_ID, percent: event.percentage });
+          });
         }
       });
+
+      // Prepare model in background
       await llmModel.current.prepare();
 
-      await initEmbeddingModel(); // Silent
+      // Initialize embedding model without blocking
+      setTimeout(() => {
+        initEmbeddingModel().catch(console.error);
+      }, 100);
 
       setDownloadProgress(null);
       setShowDownloadModal(false);
@@ -124,22 +197,29 @@ export default function ChatScreen() {
   };
 
   const loadHistory = async () => {
+    console.log('HIT Loading message history');
     const history = await loadMessages();
     setAllMessages(history);
     const initialBatch = history.slice(-BATCH_SIZE);
     setMessages(initialBatch);
     setHasMoreMessages(history.length > BATCH_SIZE);
 
-    setTimeout(() => {
-      flatListRef.current?.scrollToEnd({ animated: false });
-    }, 100);
+    // Use InteractionManager for scroll after navigation
+    InteractionManager.runAfterInteractions(() => {
+      setTimeout(() => {
+        flatListRef.current?.scrollToEnd({ animated: false });
+      }, 100);
+    });
   };
 
-  const loadMoreMessages = () => {
+  const loadMoreMessages = useCallback(() => {
+    console.log('HIT Loading more messages');
     if (isLoadingMore || !hasMoreMessages) return;
+
     setIsLoadingMore(true);
 
-    setTimeout(() => {
+    // Use requestIdleCallback for non-urgent loading
+    const loadMore = () => {
       const currentLength = messages.length;
       const remaining = allMessages.length - currentLength;
       const nextBatchSize = Math.min(BATCH_SIZE, remaining);
@@ -148,72 +228,131 @@ export default function ChatScreen() {
         allMessages.length - currentLength
       );
 
+      // Batch state updates
       setMessages((prev) => [...nextBatch, ...prev]);
       setHasMoreMessages(nextBatchSize === BATCH_SIZE);
       setIsLoadingMore(false);
-    }, 300);
-  };
+    };
 
-  const scrollToBottom = (animated = true) => {
-    if (flatListRef.current && isScrolledToBottom.current) {
-      flatListRef.current.scrollToEnd({ animated });
+    if ('requestIdleCallback' in window) {
+      requestIdleCallback(loadMore, { timeout: 1000 });
+    } else {
+      setTimeout(loadMore, 100);
     }
-  };
+  }, [isLoadingMore, hasMoreMessages, messages.length, allMessages]);
 
-  const handleScroll = ({ nativeEvent }) => {
-    // Check if user is scrolled near the bottom
+  const scrollToBottom = useCallback((animated = true) => {
+    // console.log('HIT Scrolling to bottom. Animated:', animated);
+    throttledScrollToBottom(animated);
+  }, [throttledScrollToBottom]);
+
+  const handleScroll = useCallback(({ nativeEvent }) => {
+    // console.log('HIT Handling scroll event');
     const { layoutMeasurement, contentOffset, contentSize } = nativeEvent;
     const paddingToBottom = 100;
-    isScrolledToBottom.current = 
+
+    // Update scroll position ref without state
+    isScrolledToBottom.current =
       layoutMeasurement.height + contentOffset.y >= contentSize.height - paddingToBottom;
 
-    // Load more messages when scrolling up
+    // Throttled loading of more messages
     if (contentOffset.y <= 50 && hasMoreMessages && !isLoadingMore) {
-      loadMoreMessages();
+      requestAnimationFrame(() => {
+        loadMoreMessages();
+      });
     }
-  };
+  }, [hasMoreMessages, isLoadingMore, loadMoreMessages]);
 
-  const sendMessage = async () => {
-    if (!inputText.trim() || !modelsReady) return;
+  const handleAddToLikes = useCallback(async (content) => {
+    console.log('HIT Adding message to likes:', content);
+    try {
+      await addUserLike(content);
+      Alert.alert('Success', 'Added to your likes!');
+    } catch (error) {
+      Alert.alert('Error', 'Failed to add to likes');
+    }
+  }, []);
+
+  const handleAddToDislikes = useCallback(async (content) => {
+    console.log('HIT Adding message to dislikes:', content);
+    try {
+      await addUserDislike(content);
+      Alert.alert('Success', 'Added to your dislikes!');
+    } catch (error) {
+      Alert.alert('Error', 'Failed to add to dislikes');
+    }
+  }, []);
+
+  const handleCopy = useCallback(async (content) => {
+    console.log('HIT Copying message content:', content);
+    await Clipboard.setStringAsync(content);
+  }, []);
+
+  // Optimized sendMessage with performance improvements
+  const sendMessage = useCallback(async () => {
+    console.log('HIT Sending message:', inputText);
+    if (!inputText.trim() || !modelsReady || isGenerating) return;
+
+    // Cancel any ongoing generation
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    abortControllerRef.current = new AbortController();
 
     // Hide keyboard
     Keyboard.dismiss();
 
-    const userMsg = { role: 'user', content: inputText, timestamp: Date.now() };
-    setMessages((prev) => [...prev, userMsg]);
-    setAllMessages((prev) => [...prev, userMsg]);
-    await storeMessage(userMsg);
+    const userMsg = {
+      role: 'user',
+      content: inputText,
+      timestamp: Date.now()
+    };
+
+    // Batch state updates
     setInputText('');
+    setMessages(prev => [...prev, userMsg]);
+    setAllMessages(prev => [...prev, userMsg]);
+
+    // Store message in background
+    setTimeout(() => storeMessage(userMsg), 0);
 
     const assistantTimestamp = Date.now();
     setStreamingAssistant({
       role: 'assistant',
-      content: 'Thinking...',
+      content: '',
       timestamp: assistantTimestamp,
       isThinking: true,
     });
     setIsGenerating(true);
 
-    let assistantContent = '';
-    isFirstTokenRef.current = true;
+    let fullAssistantContent = '';
+    const updateQueue = [];
 
     try {
-      await addMessageEmbedding(userMsg.content);
-      const similar = await findSimilarMessages(userMsg.content, CONFIG.topKSimilar || 4);
+      // Non-blocking embedding
+      // setTimeout(() => {
+      //   addMessageEmbedding(userMsg.content).catch(console.error);
+      // }, 0);
+
+      // Parallel execution where possible
+      const [similar, prefs] = await Promise.all([
+        findSimilarMessages(userMsg.content, CONFIG.topKSimilar || 4),
+        getUserPreferences()
+      ]);
+
       const similarContext = similar.length
         ? `Related past conversations (only highly relevant):\n${similar.map((s) => `• ${s}`).join('\n')}`
         : '';
-
-      const prefs = await getUserPreferences();
+      console.log('Similar messages found:', similar);
       const prefsText = prefs.likes.length || prefs.dislikes.length
-        ? `User preferences and memories: likes ${prefs.likes.join(', ')}, dislikes ${prefs.dislikes.join(', ')}. Behaviors: ${JSON.stringify(
-            prefs.behaviors || {}
-          )}`
+        ? `User preferences and memories: likes ${prefs.likes.join(', ')}, dislikes ${prefs.dislikes.join(', ')}. Behaviors: ${JSON.stringify(prefs.behaviors || {})}`
         : '';
 
       const systemPrompt = `${CONFIG.systemPrompt}\n${prefsText}\n${similarContext}`.trim();
 
       const recentMessages = messages.slice(-3);
+      console.log("System prompt constructed:", systemPrompt);
+      console.log('Recent messages for context:', recentMessages);
       const fullMessages = [
         { role: 'system', content: systemPrompt },
         ...recentMessages.map((m) => ({ role: m.role, content: m.content })),
@@ -224,67 +363,128 @@ export default function ChatScreen() {
       if (totalChars > 1200) {
         fullMessages.splice(1, 1);
       }
-
+      console.log('Final messages sent to model:', fullMessages);
       const { textStream } = await streamText({
         model: llmModel.current,
         messages: fullMessages,
         temperature: CONFIG.temperature,
         maxTokens: CONFIG.maxTokens,
+        experimental_transform: smoothStream({
+          delayInMs: 60,
+          chunking: 'word',
+        }),
+        abortSignal: abortControllerRef.current.signal,
       });
 
-      const updateThrottled = throttle((chunk) => {
-        setStreamingAssistant((prev) => {
-          if (!prev) return prev;
-          let newContent = (prev.content || '') + chunk;
-          if (isFirstTokenRef.current) {
-            newContent = chunk.trim();
-            isFirstTokenRef.current = false;
+      // Optimized update scheduler
+      const scheduleUpdate = () => {
+        if (updateScheduledRef.current) return;
+        updateScheduledRef.current = true;
+
+        requestAnimationFrame(() => {
+          if (updateQueue.length === 0) {
+            updateScheduledRef.current = false;
+            return;
           }
-          return { ...prev, content: newContent, isThinking: false };
+
+          const pendingContent = updateQueue.join('');
+          updateQueue.length = 0;
+
+          fullAssistantContent += pendingContent;
+
+          // Batch state update
+          setStreamingAssistant((prev) => ({
+            ...prev,
+            content: fullAssistantContent,
+            isThinking: false,
+          }));
+
+          updateScheduledRef.current = false;
         });
-        // Auto-scroll during generation
-        scrollToBottom(true);
-      }, 80);
-
-      for await (const textPart of textStream) {
-        assistantContent += textPart;
-        updateThrottled(textPart);
-      }
-      updateThrottled.flush();
-
-      const finalAssistantMsg = {
-        role: 'assistant',
-        content: assistantContent,
-        timestamp: assistantTimestamp,
       };
 
-      await storeMessage(finalAssistantMsg);
-      addMessageEmbedding(assistantContent); // fire-and-forget
-      setAllMessages((prev) => [...prev, finalAssistantMsg]);
+      // Collect chunks efficiently
+      for await (const textPart of textStream) {
+        if (abortControllerRef.current.signal.aborted) break;
 
-      setMessages((prev) => [...prev, finalAssistantMsg]);
-      setStreamingAssistant(null);
-      
-      // Scroll to bottom after message is complete
-      scrollToBottom(true);
+        updateQueue.push(textPart);
+        scheduleUpdate();
+      }
+
+      if (!abortControllerRef.current.signal.aborted) {
+    
+        // Final update
+        const finalAssistantMsg = {
+          role: 'assistant',
+          content: fullAssistantContent,
+          timestamp: assistantTimestamp,
+        };
+
+        // Parallel operations
+          await Promise.all([
+          storeMessage(finalAssistantMsg),
+          addMessageEmbedding(userMsg.content).catch(() => { }),     // user message
+          addMessageEmbedding(fullAssistantContent).catch(() => { }), // assistant reply
+        ]);
+
+        // Batch final state updates
+        setAllMessages(prev => [...prev, finalAssistantMsg]);
+        setMessages(prev => [...prev, finalAssistantMsg]);
+        setStreamingAssistant(null);
+        scrollToBottom(true);
+      }
     } catch (error) {
-      console.error('Generation failed:', error);
-      setStreamingAssistant((prev) => prev && { ...prev, content: (prev.content || '') + '\n[Generation failed]' });
+      if (error.name === 'AbortError') {
+        console.log('Generation aborted');
+      } else {
+        console.error('Generation failed:', error);
+        setStreamingAssistant(prev =>
+          prev && { ...prev, content: prev.content + '\n[Generation failed]' }
+        );
+      }
     } finally {
       setIsGenerating(false);
+      abortControllerRef.current = null;
     }
-  };
+  }, [inputText, modelsReady, isGenerating, messages, scrollToBottom]);
 
-  const handleCopy = async (content) => {
-    await Clipboard.setStringAsync(content);
-    Alert.alert('Copied to clipboard');
-  };
+  // Memoized render functions
+  const renderMessageItem = useCallback(({ item }) => (
+    <MemoizedMessageItem
+      item={item}
+      onCopy={() => handleCopy(item.content)}
+      onAddToLikes={() => handleAddToLikes(item.content)}
+      onAddToDislikes={() => handleAddToDislikes(item.content)}
+    />
+  ), [handleCopy, handleAddToLikes, handleAddToDislikes]);
+
+  const renderHeader = useCallback(() => (
+    isLoadingMore ? <ActivityIndicator size="small" color="#007AFF" style={styles.loader} /> : null
+  ), [isLoadingMore]);
+
+  const renderFooter = useCallback(() => (
+    streamingAssistant && (
+      <MemoizedMessageItem
+        item={streamingAssistant}
+        onCopy={() => handleCopy(streamingAssistant.content)}
+        onAddToLikes={() => handleAddToLikes(streamingAssistant.content)}
+        onAddToDislikes={() => handleAddToDislikes(streamingAssistant.content)}
+      />
+    )
+  ), [streamingAssistant, handleCopy, handleAddToLikes, handleAddToDislikes]);
+
+  // Memoized content size change handler
+  const handleContentSizeChange = useCallback(() => {
+    if (!isGenerating) {
+      scrollToBottom(false);
+    }
+  }, [isGenerating, scrollToBottom]);
 
   return (
     <KeyboardAvoidingView
       style={styles.container}
       behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-      keyboardVerticalOffset={Platform.OS === 'ios' ? 100 : 0}
+      keyboardVerticalOffset={Platform.OS === 'ios' ? 90 : 0}
     >
       <View style={styles.container}>
         <Modal visible={showDownloadModal} transparent animationType="fade">
@@ -302,36 +502,23 @@ export default function ChatScreen() {
         <FlashList
           ref={flatListRef}
           data={messages}
-          renderItem={({ item }) => (
-            <MemoizedMessageItem item={item} onCopy={() => handleCopy(item.content)} />
-          )}
-          keyExtractor={(item, index) => index.toString()}
+          renderItem={renderMessageItem}
+          keyExtractor={(item, index) => `msg-${item.timestamp}-${index}`}
           estimatedItemSize={100}
-          ListHeaderComponent={
-            isLoadingMore ? <ActivityIndicator size="small" color="#007AFF" style={styles.loader} /> : null
-          }
-          ListFooterComponent={
-            streamingAssistant && (
-              <MemoizedMessageItem
-                item={streamingAssistant}
-                onCopy={() => handleCopy(streamingAssistant.content)}
-              />
-            )
-          }
+          ListHeaderComponent={renderHeader}
+          ListFooterComponent={renderFooter}
           onScroll={handleScroll}
-          onContentSizeChange={() => {
-            // Scroll to bottom when content size changes and user is at bottom
-            scrollToBottom(!isGenerating);
-          }}
-          onLayout={() => {
-            // Scroll to bottom on initial layout
-            scrollToBottom(false);
-          }}
-          windowSize={7}
-          initialNumToRender={12}
-          maxToRenderPerBatch={6}
+          onContentSizeChange={handleContentSizeChange}
+          onLayout={() => scrollToBottom(false)}
+          windowSize={5} // Reduced from 7
+          initialNumToRender={10} // Reduced from 12
+          maxToRenderPerBatch={5} // Reduced from 6
           removeClippedSubviews={Platform.OS === 'android'}
           contentContainerStyle={styles.flatListContent}
+          maintainVisibleContentPosition={{
+            minIndexForVisible: 0,
+          }}
+          scrollEventThrottle={16} // Optimize scroll events
         />
 
         <View style={styles.inputContainer}>
@@ -344,24 +531,35 @@ export default function ChatScreen() {
             editable={modelsReady && !isLoading}
             multiline
             maxLength={500}
-            blurOnSubmit={false} // Prevents keyboard from closing on submit
+            blurOnSubmit={false}
             onSubmitEditing={() => {
-              if (inputText.trim()) {
+              if (inputText.trim() && !isGenerating) {
                 sendMessage();
               }
             }}
           />
           <TouchableOpacity
-            style={[styles.sendButton, !modelsReady && styles.disabledButton]}
-            onPress={isGenerating ? () => Alert.alert('Processing...', 'Please wait...') : sendMessage}
-            disabled={!modelsReady}
+            style={[
+              styles.sendButton,
+              (!modelsReady || isGenerating) && styles.disabledButton
+            ]}
+            onPress={isGenerating ? null : sendMessage}
+            disabled={!modelsReady || isGenerating}
             activeOpacity={0.7}
           >
-            <Text style={styles.sendButtonText}>{isGenerating ? '⏳' : '➤'}</Text>
+            <Text style={styles.sendButtonText}>
+              {isGenerating ? '⏳' : '➤'}
+            </Text>
           </TouchableOpacity>
         </View>
 
-        {isLoading && <ActivityIndicator size="large" color="#007AFF" style={styles.globalLoader} />}
+        {isLoading && (
+          <ActivityIndicator
+            size="large"
+            color="#007AFF"
+            style={styles.globalLoader}
+          />
+        )}
       </View>
     </KeyboardAvoidingView>
   );

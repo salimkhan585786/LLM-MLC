@@ -1,3 +1,12 @@
+// Polyfill for DOMException (required by AI SDK in React Native)
+if (typeof global.DOMException === 'undefined') {
+  global.DOMException = function DOMException(message, name) {
+    this.message = message || '';
+    this.name = name || 'Error';
+  };
+  global.DOMException.prototype = Object.create(Error.prototype);
+  global.DOMException.prototype.constructor = global.DOMException;
+}
 import { llama } from '@react-native-ai/llama';
 import { embed } from 'ai';
 import * as FileSystem from 'expo-file-system/legacy';
@@ -8,9 +17,10 @@ let embedModel = null;
 
 // Path to the bundled model in your app
 const BUNDLED_MODEL_NAME = 'bge-small-en-v1.5-q4_k_m.gguf';
-
+let isModelReady = false;
 
 const saveEmbeddings = async () => {
+  console.log('HIT Saving embeddings to storage, count:', vectorStore.length);
   try {
     // Prune old/low-relevance: Keep top 100 recent + high similarity (optional periodic call)
     vectorStore.sort((a, b) => b.timestamp - a.timestamp); // Recent first
@@ -46,6 +56,7 @@ if (!(await FileSystem.getInfoAsync(dest)).exists) {
     
     console.log('⚙️ Preparing model...');
     await embedModel.prepare();
+     isModelReady = true; // <-- set flag
     
     console.log('✅✅ Embedding model ready!');
     
@@ -62,39 +73,38 @@ if (!(await FileSystem.getInfoAsync(dest)).exists) {
     
   } catch (error) {
     console.error('❌ Failed to initialize embedding model:', error);
+    isModelReady = false;
     throw error;
   }
 };
 
 export const addMessageEmbedding = async (text) => {
-  if (!embedModel) {
-    console.warn('Embedding model not available');
-    return null;
-  }
-  
-  try {
-    const { embedding } = await embed({ 
-      model: embedModel, 
-      value: text 
-    });
-    
-    vectorStore.push({ 
-      text, 
-      embedding, 
-      timestamp: Date.now(),
-      sentiment: detectSentiment(text) // Improved tagging
-    });
-    
+  console.log('HIT Adding message embedding:', text);
+  if (!isModelReady) return null;
+
+  // Very important: delay + requestIdleCallback
+  return new Promise(resolve => {
+    const task = async () => {
+      try {
+        const { embedding } = await embed({ model: embedModel, value: text });
+        vectorStore.push({ text, embedding, timestamp: Date.now() });
     await saveEmbeddings();
-    
-    return embedding;
-  } catch (error) {
-    console.error('Failed to add message embedding:', error);
-    return null;
-  }
+        resolve(embedding);
+      } catch (err) {
+        resolve(null);
+      }
+    };
+
+    if ('requestIdleCallback' in global) {
+      requestIdleCallback(task, { timeout: 4000 });
+    } else {
+      setTimeout(task, 300); // fallback
+    }
+  });
 };
 // Simple sentiment detection (expand with more words/rules)
 function detectSentiment(text) {
+  console.log('HIT Detecting sentiment for text:', text);
   const positiveWords = ['happy', 'great', 'love', 'good', 'awesome'];
   const negativeWords = ['sad', 'bad', 'hate', 'wrong'];
   if (positiveWords.some(w => text.toLowerCase().includes(w))) return 'positive';
@@ -102,6 +112,7 @@ function detectSentiment(text) {
   return 'neutral';
 }
 export const findSimilarMessages = async (query, topK = 4) => {
+  console.log('HIT Finding similar messages for query:', query);
   if (!embedModel || vectorStore.length === 0) return [];
   
   try {
@@ -134,19 +145,27 @@ export const findSimilarMessages = async (query, topK = 4) => {
 
 // Simple overlap: At least 1 shared non-stop word
 function hasKeywordOverlap(query, text) {
+  console.log('HIT Checking keyword overlap between query and text');
   const stopWords = new Set(['the', 'is', 'a', 'an', 'to', 'in', 'on', 'and', 'or']);
   const queryWords = query.toLowerCase().split(/\s+/).filter(w => !stopWords.has(w));
   const textWords = text.toLowerCase().split(/\s+/).filter(w => !stopWords.has(w));
   return queryWords.some(qw => textWords.includes(qw));
 }
 function cosineSimilarity(a, b) {
-  const dot = a.reduce((sum, val, i) => sum + val * b[i], 0);
-  const normA = Math.sqrt(a.reduce((sum, val) => sum + val * val, 0));
-  const normB = Math.sqrt(b.reduce((sum, val) => sum + val * val, 0));
-  return dot / (normA * normB);
+  let dot = 0, normA = 0, normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    const ai = a[i];
+    const bi = b[i];
+    dot += ai * bi;
+    normA += ai * ai;
+    normB += bi * bi;
+  }
+  if (normA === 0 || normB === 0) return 0;
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
 export const unloadEmbeddingModel = async () => {
+  console.log('HIT Unloading embedding model');
   if (embedModel) {
     await embedModel.unload();
     embedModel = null;
@@ -154,6 +173,7 @@ export const unloadEmbeddingModel = async () => {
 };
 
 export const getVectorStoreStats = () => {
+  console.log('HIT Getting vector store stats');
   return {
     messageCount: vectorStore.length,
     modelLoaded: embedModel !== null
